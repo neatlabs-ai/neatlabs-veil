@@ -1,1 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#030308;overflow:hidden;height:100vh;width:100vw;cursor:grab;font-family:'Courier New',monospace;}
+body.dragging{cursor:grabbing;}
+canvas{display:block;width:100%;height:100%;}
+</style>
+</head>
+<body>
+<canvas id="g"></canvas>
+<script>
+// ============================================================
+// VEIL GLOBE v3.0 — Pure Canvas 2D, Zero Dependencies
+// Enhanced Esri-inspired visualization
+// NEATLABS Intelligence Technology
+// ============================================================
+const C = document.getElementById('g'), X = C.getContext('2d');
+let W, H, cx, cy;
 
+function resize() {
+    W = C.width = window.innerWidth;
+    H = C.height = window.innerHeight;
+    cx = W / 2;
+    cy = H / 2;
+    initStars();
+    initNebula();
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Config
+const ORIGIN = { lat: 38.88, lng: -76.95 };
+const MAX_ARCS = 55, MAX_PARTICLES = 350, MAX_RINGS = 18, MAX_DEST = 90;
+let rotX = 0.4, rotY = 0, dragging = false, lastMX = 0, lastMY = 0, autoRot = true;
+const globeR = () => Math.min(W, H) * 0.31;
+
+// 3D math
+function rotate(x, y, z) {
+    const cy1 = Math.cos(rotX), sy1 = Math.sin(rotX);
+    const y1 = y * cy1 - z * sy1, z1 = y * sy1 + z * cy1;
+    const cx1 = Math.cos(rotY), sx1 = Math.sin(rotY);
+    return { x: x * cx1 + z1 * sx1, y: y1, z: -x * sx1 + z1 * cx1 };
+}
+function project(x, y, z) {
+    const f = 600, s = f / (f + z);
+    return { x: cx + x * s, y: cy + y * s, s, z };
+}
+function latLng(lat, lng, r) {
+    const p = (90 - lat) * Math.PI / 180, t = (lng + 180) * Math.PI / 180;
+    return { x: -r * Math.sin(p) * Math.cos(t), y: r * Math.cos(p), z: r * Math.sin(p) * Math.sin(t) };
+}
+
+// Stars
+let stars = [], nebulae = [];
+function initStars() {
+    stars = [];
+    for (let i = 0; i < 400; i++) {
+        stars.push({
+            x: Math.random() * W, y: Math.random() * H,
+            sz: Math.random() * 1.6 + 0.2,
+            speed: Math.random() * 2 + 0.5,
+            offset: Math.random() * 6.28,
+            hue: Math.random() < 0.12 ? 180 + Math.random() * 60 : 0,
+        });
+    }
+}
+function initNebula() {
+    nebulae = [];
+    for (let i = 0; i < 10; i++) {
+        nebulae.push({
+            x: Math.random() * W, y: Math.random() * H,
+            r: 60 + Math.random() * 240,
+            hue: [190, 260, 320, 210, 280][Math.floor(Math.random() * 5)],
+            alpha: 0.012 + Math.random() * 0.018,
+            drift: Math.random() * 0.06 - 0.03,
+        });
+    }
+}
+
+// Continent data — dense dot clusters for landmasses
+const continentDots = [];
+const regions = [
+    // NA
+    [30,50,-128,-65,300],[50,60,-130,-55,120],[25,30,-100,-80,60],[55,70,-170,-130,40],
+    // Central America & Caribbean
+    [10,25,-110,-60,80],
+    // South America
+    [-55,12,-82,-34,280],[0,5,-80,-50,50],
+    // Europe
+    [36,60,-10,30,250],[44,55,20,45,80],[55,65,5,30,50],[60,70,5,30,40],
+    // Africa
+    [-35,35,-18,52,300],[0,15,30,42,60],
+    // Middle East
+    [15,40,35,60,80],[24,38,44,56,40],
+    // Russia/Central Asia
+    [45,65,40,140,200],[50,70,60,100,80],
+    // South Asia
+    [5,35,65,90,150],[8,20,72,88,50],
+    // East Asia
+    [20,50,100,140,200],[22,46,108,130,80],
+    // Southeast Asia
+    [-10,20,95,142,120],
+    // Oceania
+    [-45,-10,112,155,150],[-47,-34,166,178,30],
+    // Japan/Korea
+    [30,46,128,146,50],
+    // UK/Ireland
+    [50,58,-10,2,40],[51,55,-6,0,25],
+    // Scandinavia
+    [55,70,5,30,60],
+    // Iceland/Greenland
+    [63,67,-24,-13,15],[60,82,-55,-15,30],
+];
+regions.forEach(([latMin, latMax, lngMin, lngMax, count]) => {
+    for (let i = 0; i < count; i++) {
+        continentDots.push({
+            lat: latMin + Math.random() * (latMax - latMin),
+            lng: lngMin + Math.random() * (lngMax - lngMin),
+            sz: 0.4 + Math.random() * 1.8,
+            bright: 0.15 + Math.random() * 0.35,
+            isCity: Math.random() < 0.05,
+        });
+    }
+});
+
+// Connection systems
+const arcs = [], destMarkers = [], ringPulses = [], particles = [];
+let totalArcs = 0, trackerArcs = 0, activeConns = 0;
+
+window.activateArc = function(d) {
+    const tk = d.tracker || false;
+    const colors = tk
+        ? ['#ff3344','#ff1133','#ff5566']
+        : ['#00f0ff','#ff00aa','#00ff88','#8844ff','#ffaa00','#00ddff'];
+    const c = colors[Math.floor(Math.random() * colors.length)];
+
+    arcs.push({
+        sLa: ORIGIN.lat, sLo: ORIGIN.lng, eLa: d.lat, eLo: d.lng,
+        progress: 0, life: 0, maxLife: 3.5 + Math.random() * 4,
+        speed: 0.2 + Math.random() * 0.3, color: c, tracker: tk,
+        pulsePos: 0, pulseSpeed: 0.25 + Math.random() * 0.2,
+        lineWidth: tk ? 2.5 : 1.5, glowSize: tk ? 16 : 10,
+    });
+    if (arcs.length > MAX_ARCS) arcs.shift();
+
+    destMarkers.push({ lat: d.lat, lng: d.lng, color: c, alpha: 1.0, time: performance.now() / 1000, tracker: tk });
+    if (destMarkers.length > MAX_DEST) destMarkers.shift();
+
+    ringPulses.push({ lat: d.lat, lng: d.lng, color: c, radius: 0, maxR: tk ? 38 : 28, alpha: 0.9, speed: 35 + Math.random() * 25 });
+    if (ringPulses.length > MAX_RINGS) ringPulses.shift();
+
+    for (let i = 0; i < 3 + Math.floor(Math.random() * 5); i++) {
+        particles.push({
+            sLa: ORIGIN.lat, sLo: ORIGIN.lng, eLa: d.lat, eLo: d.lng,
+            pos: Math.random() * 0.3, speed: 0.12 + Math.random() * 0.25,
+            color: c, size: tk ? 3 : 2, maxLife: 2.5 + Math.random() * 3, age: 0,
+        });
+    }
+    if (particles.length > MAX_PARTICLES) particles.splice(0, particles.length - MAX_PARTICLES);
+
+    totalArcs++;
+    if (tk) trackerArcs++;
+};
+
+// Demo destinations
+const demoTargets = [
+    {lat:37.77,lng:-122.42},{lat:51.51,lng:-0.13},{lat:35.68,lng:139.69},
+    {lat:50.12,lng:8.68},{lat:1.35,lng:103.82},{lat:-33.87,lng:151.21},
+    {lat:37.4,lng:-122.07},{lat:47.6,lng:-122.3},{lat:40.71,lng:-74.01},
+    {lat:19.08,lng:72.88},{lat:-23.55,lng:-46.63},{lat:59.33,lng:18.07},
+    {lat:55.75,lng:37.62},{lat:22.28,lng:114.16},{lat:48.86,lng:2.35},
+    {lat:52.52,lng:13.41},{lat:34.05,lng:-118.24},{lat:25.2,lng:55.27},
+];
+
+// Mouse interaction
+C.addEventListener('mousedown', e => {
+    dragging = true; document.body.classList.add('dragging');
+    lastMX = e.clientX; lastMY = e.clientY; autoRot = false;
+});
+C.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    rotY += (e.clientX - lastMX) * 0.005;
+    rotX += (e.clientY - lastMY) * 0.005;
+    rotX = Math.max(-1.3, Math.min(1.3, rotX));
+    lastMX = e.clientX; lastMY = e.clientY;
+});
+C.addEventListener('mouseup', () => {
+    dragging = false; document.body.classList.remove('dragging');
+    setTimeout(() => autoRot = true, 4000);
+});
+C.addEventListener('mouseleave', () => {
+    dragging = false; document.body.classList.remove('dragging');
+});
+
+// ---- RENDER FUNCTIONS ----
+
+function drawBackground(t) {
+    // Deep space gradient
+    const bg = X.createRadialGradient(cx, cy, 0, cx, cy, Math.max(W, H) * 0.7);
+    bg.addColorStop(0, '#080818');
+    bg.addColorStop(0.4, '#050512');
+    bg.addColorStop(0.7, '#030309');
+    bg.addColorStop(1, '#020206');
+    X.fillStyle = bg;
+    X.fillRect(0, 0, W, H);
+
+    // Nebulae
+    nebulae.forEach(n => {
+        n.x += n.drift;
+        if (n.x < -n.r) n.x = W + n.r;
+        if (n.x > W + n.r) n.x = -n.r;
+        const g = X.createRadialGradient(n.x, n.y, 0, n.x, n.y, n.r);
+        g.addColorStop(0, `hsla(${n.hue},80%,35%,${n.alpha})`);
+        g.addColorStop(0.4, `hsla(${n.hue},60%,20%,${n.alpha * 0.5})`);
+        g.addColorStop(1, 'transparent');
+        X.fillStyle = g;
+        X.beginPath(); X.arc(n.x, n.y, n.r, 0, 6.28); X.fill();
+    });
+
+    // Stars with twinkle
+    stars.forEach(s => {
+        const a = 0.2 + Math.sin(t * s.speed + s.offset) * 0.25;
+        if (s.hue > 0) {
+            X.fillStyle = `hsla(${s.hue},70%,75%,${a})`;
+        } else {
+            X.fillStyle = `rgba(255,255,255,${a})`;
+        }
+        X.fillRect(s.x, s.y, s.sz, s.sz);
+    });
+}
+
+function drawGlobe(t) {
+    const r = globeR();
+
+    // Outer atmospheric glow — multi-layered
+    for (let i = 3; i >= 0; i--) {
+        const gr = r * (1.08 + i * 0.06);
+        const glowAlpha = (0.025 - i * 0.004) + Math.sin(t * 0.4) * 0.005;
+        const atmos = X.createRadialGradient(cx, cy, r * 0.95, cx, cy, gr);
+        atmos.addColorStop(0, 'rgba(0,180,255,0)');
+        atmos.addColorStop(0.3, `rgba(0,180,255,${glowAlpha})`);
+        atmos.addColorStop(0.6, `rgba(0,120,255,${glowAlpha * 0.6})`);
+        atmos.addColorStop(1, 'rgba(0,60,255,0)');
+        X.fillStyle = atmos;
+        X.beginPath(); X.arc(cx, cy, gr, 0, 6.28); X.fill();
+    }
+
+    // Globe body — proper sphere shading
+    const bodyGrad = X.createRadialGradient(cx - r * 0.2, cy - r * 0.2, r * 0.05, cx, cy, r);
+    bodyGrad.addColorStop(0, '#0e0e30');
+    bodyGrad.addColorStop(0.4, '#090920');
+    bodyGrad.addColorStop(0.7, '#060615');
+    bodyGrad.addColorStop(1, '#030310');
+    X.fillStyle = bodyGrad;
+    X.beginPath(); X.arc(cx, cy, r, 0, 6.28); X.fill();
+
+    // Edge highlight — simulates specular rim
+    const rimGrad = X.createRadialGradient(cx, cy, r * 0.88, cx, cy, r * 1.01);
+    rimGrad.addColorStop(0, 'rgba(0,180,255,0)');
+    rimGrad.addColorStop(0.7, `rgba(0,180,255,${0.04 + Math.sin(t * 0.6) * 0.015})`);
+    rimGrad.addColorStop(1, 'rgba(0,100,255,0)');
+    X.fillStyle = rimGrad;
+    X.beginPath(); X.arc(cx, cy, r * 1.01, 0, 6.28); X.fill();
+
+    // Grid lines — latitude
+    X.lineWidth = 0.4;
+    for (let lat = -80; lat <= 80; lat += 20) {
+        const lineAlpha = 0.035 + Math.sin(t * 0.3 + lat * 0.05) * 0.008;
+        X.strokeStyle = `rgba(0,200,255,${lineAlpha})`;
+        X.beginPath();
+        let first = true;
+        for (let lng = 0; lng <= 360; lng += 2.5) {
+            const p = latLng(lat, lng, r);
+            const rv = rotate(p.x, p.y, p.z);
+            if (rv.z > 0) { first = true; continue; }
+            const pp = project(rv.x, rv.y, rv.z);
+            if (first) { X.moveTo(pp.x, pp.y); first = false; }
+            else X.lineTo(pp.x, pp.y);
+        }
+        X.stroke();
+    }
+
+    // Grid lines — longitude
+    for (let lng = 0; lng < 360; lng += 20) {
+        const lineAlpha = 0.035 + Math.sin(t * 0.3 + lng * 0.03) * 0.008;
+        X.strokeStyle = `rgba(0,200,255,${lineAlpha})`;
+        X.beginPath();
+        let first = true;
+        for (let lat = -90; lat <= 90; lat += 2.5) {
+            const p = latLng(lat, lng, r);
+            const rv = rotate(p.x, p.y, p.z);
+            if (rv.z > 0) { first = true; continue; }
+            const pp = project(rv.x, rv.y, rv.z);
+            if (first) { X.moveTo(pp.x, pp.y); first = false; }
+            else X.lineTo(pp.x, pp.y);
+        }
+        X.stroke();
+    }
+
+    // Globe edge ring
+    const edgeAlpha = 0.12 + Math.sin(t * 1.2) * 0.04;
+    X.strokeStyle = `rgba(0,200,255,${edgeAlpha})`;
+    X.lineWidth = 1.5;
+    X.beginPath(); X.arc(cx, cy, r, 0, 6.28); X.stroke();
+
+    // Thin outer ring
+    X.strokeStyle = `rgba(0,160,255,${edgeAlpha * 0.3})`;
+    X.lineWidth = 0.8;
+    X.beginPath(); X.arc(cx, cy, r * 1.015, 0, 6.28); X.stroke();
+}
+
+function drawContinents(t) {
+    const r = globeR();
+    continentDots.forEach(d => {
+        const p = latLng(d.lat, d.lng, r * 1.003);
+        const rv = rotate(p.x, p.y, p.z);
+        if (rv.z > 0) return;
+        const pp = project(rv.x, rv.y, rv.z);
+        const depth = Math.min(0.65, 0.2 + pp.s * 0.3);
+        const sz = Math.max(0.6, d.sz * pp.s);
+
+        if (d.isCity) {
+            // City glow — brighter dot with radial glow
+            X.fillStyle = `rgba(0,220,255,${depth * 1.2})`;
+            X.beginPath(); X.arc(pp.x, pp.y, sz * 1.5, 0, 6.28); X.fill();
+
+            const cityGlow = X.createRadialGradient(pp.x, pp.y, 0, pp.x, pp.y, sz * 6);
+            cityGlow.addColorStop(0, `rgba(0,200,255,${depth * 0.25})`);
+            cityGlow.addColorStop(1, 'rgba(0,200,255,0)');
+            X.fillStyle = cityGlow;
+            X.beginPath(); X.arc(pp.x, pp.y, sz * 6, 0, 6.28); X.fill();
+        } else {
+            // Regular continent dot
+            const green = Math.floor(180 + d.bright * 60);
+            const blue = Math.floor(200 + d.bright * 55);
+            X.fillStyle = `rgba(0,${green},${blue},${depth * d.bright})`;
+            X.fillRect(pp.x - sz / 2, pp.y - sz / 2, sz, sz);
+        }
+    });
+}
+
+function drawOrigin(t) {
+    const r = globeR();
+    const p = latLng(ORIGIN.lat, ORIGIN.lng, r * 1.01);
+    const rv = rotate(p.x, p.y, p.z);
+    if (rv.z > r * 0.3) return;
+    const pp = project(rv.x, rv.y, rv.z);
+
+    // Triple pulse rings
+    for (let i = 0; i < 3; i++) {
+        const pr = (8 + i * 9 + Math.sin(t * 3 - i * 0.8) * 6) * pp.s;
+        const pa = Math.max(0, (0.45 - i * 0.12) + Math.sin(t * 3 - i * 0.8) * 0.15);
+        X.strokeStyle = `rgba(0,255,102,${pa})`;
+        X.lineWidth = 1.8 - i * 0.4;
+        X.beginPath(); X.arc(pp.x, pp.y, pr, 0, 6.28); X.stroke();
+    }
+
+    // Rotating scanner ring
+    const sa = t * 2;
+    X.strokeStyle = 'rgba(0,255,102,0.3)';
+    X.lineWidth = 1.2;
+    X.beginPath(); X.arc(pp.x, pp.y, 22 * pp.s, sa, sa + 1.8); X.stroke();
+
+    // Center dot with glow
+    X.fillStyle = '#00ff66';
+    X.shadowColor = '#00ff66';
+    X.shadowBlur = 20;
+    X.beginPath(); X.arc(pp.x, pp.y, 5 * pp.s, 0, 6.28); X.fill();
+    X.shadowBlur = 0;
+
+    // Label
+    if (rv.z < -r * 0.1) {
+        X.fillStyle = 'rgba(0,255,102,0.75)';
+        X.font = `bold ${Math.max(8, Math.round(10 * pp.s))}px monospace`;
+        X.fillText('\u25cf YOUR DEVICE', pp.x + 14 * pp.s, pp.y - 10 * pp.s);
+    }
+}
+
+function drawArcs(dt, t) {
+    const r = globeR();
+    activeConns = 0;
+
+    arcs.forEach(a => {
+        a.life += dt;
+        a.pulsePos += dt * a.pulseSpeed;
+        if (a.pulsePos > 1) a.pulsePos = 0;
+        if (a.life >= a.maxLife) return;
+        activeConns++;
+
+        // Build arc points
+        const pts = [];
+        const steps = 56;
+        let dL = a.eLo - a.sLo;
+        if (dL > 180) dL -= 360;
+        if (dL < -180) dL += 360;
+        const dist = Math.sqrt(Math.pow(a.eLa - a.sLa, 2) + Math.pow(dL, 2));
+
+        for (let i = 0; i <= steps; i++) {
+            const tt = i / steps;
+            const lat = a.sLa + (a.eLa - a.sLa) * tt;
+            const lng = a.sLo + dL * tt;
+            const elev = 1 + Math.sin(tt * Math.PI) * (dist / 180) * 0.4;
+            const p = latLng(lat, lng, r * elev);
+            const rv = rotate(p.x, p.y, p.z);
+            const pp = project(rv.x, rv.y, rv.z);
+            pts.push({ x: pp.x, y: pp.y, z: rv.z, s: pp.s });
+        }
+
+        // Fade in/out
+        const lifeRatio = a.life / a.maxLife;
+        let baseAlpha = lifeRatio < 0.1 ? lifeRatio / 0.1 : lifeRatio > 0.7 ? (1 - lifeRatio) / 0.3 : 1;
+
+        // Draw arc segments
+        for (let i = 1; i < pts.length; i++) {
+            if (pts[i - 1].z > r * 0.4 && pts[i].z > r * 0.4) continue;
+            const segAlpha = baseAlpha * (pts[i].z < 0 ? 0.75 : 0.12);
+
+            // Glow pass
+            X.globalAlpha = segAlpha * 0.3;
+            X.strokeStyle = a.color;
+            X.lineWidth = a.glowSize;
+            X.beginPath(); X.moveTo(pts[i - 1].x, pts[i - 1].y); X.lineTo(pts[i].x, pts[i].y); X.stroke();
+
+            // Main line
+            X.globalAlpha = segAlpha;
+            X.lineWidth = a.lineWidth;
+            X.beginPath(); X.moveTo(pts[i - 1].x, pts[i - 1].y); X.lineTo(pts[i].x, pts[i].y); X.stroke();
+        }
+        X.globalAlpha = 1;
+
+        // Traveling pulse dot
+        const pi = Math.floor(a.pulsePos * steps);
+        if (pi >= 0 && pi < pts.length && pts[pi].z < r * 0.3) {
+            const pp = pts[pi];
+
+            // Trail dots
+            for (let j = Math.max(0, pi - 5); j < pi; j++) {
+                if (pts[j].z > r * 0.3) continue;
+                const ta = (1 - (pi - j) / 6) * 0.45 * baseAlpha;
+                X.fillStyle = a.color;
+                X.globalAlpha = ta;
+                X.beginPath();
+                X.arc(pts[j].x, pts[j].y, (a.tracker ? 2.5 : 1.5) * pts[j].s, 0, 6.28);
+                X.fill();
+            }
+            X.globalAlpha = 1;
+
+            // Head dot
+            X.fillStyle = '#ffffff';
+            X.shadowColor = a.color;
+            X.shadowBlur = 18;
+            X.beginPath();
+            X.arc(pp.x, pp.y, (a.tracker ? 5 : 3.5) * pp.s, 0, 6.28);
+            X.fill();
+            X.shadowBlur = 0;
+        }
+    });
+}
+
+function drawParticles(dt) {
+    const r = globeR();
+    particles.forEach(p => {
+        p.age += dt;
+        if (p.age > p.maxLife) return;
+        p.pos += dt * p.speed;
+        if (p.pos > 1) p.pos = 0;
+
+        let dL = p.eLo - p.sLo;
+        if (dL > 180) dL -= 360;
+        if (dL < -180) dL += 360;
+        const dist = Math.sqrt(Math.pow(p.eLa - p.sLa, 2) + Math.pow(dL, 2));
+        const lat = p.sLa + (p.eLa - p.sLa) * p.pos;
+        const lng = p.sLo + dL * p.pos;
+        const elev = 1 + Math.sin(p.pos * Math.PI) * (dist / 180) * 0.4;
+        const p3 = latLng(lat, lng, r * elev);
+        const rv = rotate(p3.x, p3.y, p3.z);
+        if (rv.z > r * 0.3) return;
+        const pp = project(rv.x, rv.y, rv.z);
+
+        const lifeAlpha = Math.min(1, 1 - (p.age / p.maxLife));
+        X.fillStyle = p.color;
+        X.globalAlpha = lifeAlpha * 0.55;
+        X.beginPath();
+        X.arc(pp.x, pp.y, p.size * pp.s, 0, 6.28);
+        X.fill();
+        X.globalAlpha = 1;
+    });
+    // Cleanup expired
+    for (let i = particles.length - 1; i >= 0; i--) {
+        if (particles[i].age > particles[i].maxLife) particles.splice(i, 1);
+    }
+}
+
+function drawRingPulses(dt) {
+    const r = globeR();
+    ringPulses.forEach(rp => {
+        rp.radius += dt * rp.speed;
+        rp.alpha = Math.max(0, 0.9 * (1 - rp.radius / rp.maxR));
+        if (rp.alpha <= 0) return;
+        const p = latLng(rp.lat, rp.lng, r * 1.01);
+        const rv = rotate(p.x, p.y, p.z);
+        if (rv.z > r * 0.2) return;
+        const pp = project(rv.x, rv.y, rv.z);
+        X.strokeStyle = rp.color;
+        X.globalAlpha = rp.alpha;
+        X.lineWidth = 1.5;
+        X.beginPath(); X.arc(pp.x, pp.y, rp.radius * pp.s, 0, 6.28); X.stroke();
+        X.globalAlpha = 1;
+    });
+    for (let i = ringPulses.length - 1; i >= 0; i--) {
+        if (ringPulses[i].alpha <= 0) ringPulses.splice(i, 1);
+    }
+}
+
+function drawDestMarkers(t) {
+    const r = globeR();
+    destMarkers.forEach((m, i) => {
+        const p = latLng(m.lat, m.lng, r * 1.01);
+        const rv = rotate(p.x, p.y, p.z);
+        if (rv.z > r * 0.2) return;
+        const pp = project(rv.x, rv.y, rv.z);
+        const decay = Math.max(0.03, m.alpha - (t - m.time) * 0.012);
+        if (decay <= 0) return;
+
+        const pulse = 1 + Math.sin(t * 2.5 + i * 0.7) * 0.4;
+        const sz = (m.tracker ? 4.5 : 3) * pp.s * pulse;
+
+        // Glow
+        X.fillStyle = m.color;
+        X.globalAlpha = decay * 0.35;
+        X.shadowColor = m.color;
+        X.shadowBlur = m.tracker ? 12 : 8;
+        X.beginPath(); X.arc(pp.x, pp.y, sz * 1.8, 0, 6.28); X.fill();
+        X.shadowBlur = 0;
+
+        // Core dot
+        X.globalAlpha = decay * 0.8;
+        X.beginPath(); X.arc(pp.x, pp.y, sz, 0, 6.28); X.fill();
+
+        // White center
+        X.fillStyle = '#ffffff';
+        X.globalAlpha = decay * 0.4;
+        X.beginPath(); X.arc(pp.x, pp.y, sz * 0.35, 0, 6.28); X.fill();
+        X.globalAlpha = 1;
+    });
+}
+
+function drawHUD(t) {
+    const alpha = 0.3 + Math.sin(t) * 0.05;
+
+    // Corner brackets
+    X.strokeStyle = `rgba(0,240,255,${alpha * 0.5})`;
+    X.lineWidth = 1;
+    const bl = 35;
+    [[15,bl+15,15,15,bl+15,15],[W-15,H-bl-15,W-15,H-15,W-bl-15,H-15],
+     [W-15,bl+15,W-15,15,W-bl-15,15],[15,H-bl-15,15,H-15,bl+15,H-15]].forEach(([x1,y1,x2,y2,x3,y3]) => {
+        X.beginPath(); X.moveTo(x1,y1); X.lineTo(x2,y2); X.lineTo(x3,y3); X.stroke();
+    });
+
+    // Stats
+    X.fillStyle = `rgba(0,240,255,${alpha})`;
+    X.font = '9px monospace';
+    X.fillText('VEIL GLOBE v3.0', 22, 32);
+    X.fillStyle = `rgba(0,240,255,${alpha * 0.65})`;
+    X.fillText(`ACTIVE ARCS: ${activeConns}`, 22, 48);
+    X.fillText(`TOTAL: ${totalArcs}`, 22, 62);
+    X.fillText(`TRACKERS: ${trackerArcs}`, 22, 76);
+    X.fillText(`ENDPOINTS: ${destMarkers.length}`, 22, 90);
+    X.fillText(`PARTICLES: ${particles.length}`, 22, 104);
+
+    // Monitoring status
+    X.fillStyle = 'rgba(0,255,102,0.5)';
+    X.textAlign = 'right';
+    X.fillText('\u25cf MONITORING', W - 22, 32);
+    X.textAlign = 'left';
+
+    // Tracker warning
+    if (trackerArcs > 0) {
+        const tw = `\u26a0 ${trackerArcs} TRACKER${trackerArcs > 1 ? 'S' : ''} DETECTED`;
+        X.font = 'bold 11px monospace';
+        const tm = X.measureText(tw);
+        X.fillStyle = `rgba(255,51,68,${0.5 + Math.sin(t * 3) * 0.3})`;
+        X.fillText(tw, cx - tm.width / 2, H - 22);
+    }
+
+    // Crosshair
+    X.strokeStyle = `rgba(0,240,255,${0.03 + Math.sin(t * 0.5) * 0.015})`;
+    X.lineWidth = 0.5;
+    X.beginPath(); X.moveTo(cx - 28, cy); X.lineTo(cx + 28, cy); X.stroke();
+    X.beginPath(); X.moveTo(cx, cy - 28); X.lineTo(cx, cy + 28); X.stroke();
+
+    // Scanlines
+    X.fillStyle = 'rgba(0,240,255,0.005)';
+    for (let y = 0; y < H; y += 3) X.fillRect(0, y, W, 1);
+}
+
+// ---- ANIMATION LOOP ----
+let lastTime = 0, demoTimer = 0;
+
+function render(timestamp) {
+    requestAnimationFrame(render);
+    const t = timestamp / 1000;
+    const dt = Math.min(0.05, t - lastTime);
+    lastTime = t;
+
+    if (autoRot) rotY += 0.003;
+
+    drawBackground(t);
+    drawGlobe(t);
+    drawContinents(t);
+    drawOrigin(t);
+    drawArcs(dt, t);
+    drawParticles(dt);
+    drawRingPulses(dt);
+    drawDestMarkers(t);
+    drawHUD(t);
+
+    // Demo traffic
+    demoTimer += dt;
+    if (demoTimer > 0.7) {
+        demoTimer = 0;
+        if (Math.random() < 0.6) {
+            const d = demoTargets[Math.floor(Math.random() * demoTargets.length)];
+            window.activateArc({
+                lat: d.lat + Math.random() * 3 - 1.5,
+                lng: d.lng + Math.random() * 3 - 1.5,
+                tracker: Math.random() < 0.18,
+            });
+        }
+    }
+}
+
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
