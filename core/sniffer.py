@@ -268,12 +268,51 @@ class ProcessResolver:
     def __init__(self):
         self._cache: Dict[str, str] = {}
         self._pid_cache: Dict[str, int] = {}
+        self._pid_name_map: Dict[int, str] = {}  # PID → process name
+        self._port_pid_map: Dict[int, int] = {}   # local port → PID
         self._psutil_available = False
+        self._last_refresh = 0.0
         try:
             import psutil
             self._psutil_available = True
+            self._pre_populate()
         except ImportError:
             logger.warning("psutil not available — process resolution disabled")
+
+    def _pre_populate(self):
+        """Pre-populate PID→name cache from all running processes."""
+        try:
+            import psutil
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    self._pid_name_map[proc.info['pid']] = proc.info['name']
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            # Also cache all current connections
+            self._refresh_port_map()
+            logger.info(f"Pre-populated {len(self._pid_name_map)} process names")
+        except Exception as e:
+            logger.debug(f"Pre-populate failed: {e}")
+
+    def _refresh_port_map(self):
+        """Refresh the local-port-to-PID mapping."""
+        now = time.time()
+        if now - self._last_refresh < 0.5:
+            return
+        self._last_refresh = now
+        try:
+            import psutil
+            self._port_pid_map.clear()
+            for conn in psutil.net_connections(kind="inet"):
+                if conn.pid and conn.laddr:
+                    self._port_pid_map[conn.laddr.port] = conn.pid
+                    if conn.pid not in self._pid_name_map:
+                        try:
+                            self._pid_name_map[conn.pid] = psutil.Process(conn.pid).name()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+        except Exception:
+            pass
 
     def resolve(self, src_ip: str, src_port: int, dst_ip: str, dst_port: int,
                 protocol: str = "tcp") -> tuple:
@@ -285,23 +324,37 @@ class ProcessResolver:
         if not self._psutil_available:
             return "Unknown", 0
 
+        # Fast path: check port→PID map
+        pid = self._port_pid_map.get(src_port) or self._port_pid_map.get(dst_port)
+        if pid and pid in self._pid_name_map:
+            name = self._pid_name_map[pid]
+            self._cache[key] = name
+            self._pid_cache[key] = pid
+            return name, pid
+
+        # Slow path: refresh and retry
+        self._refresh_port_map()
+        pid = self._port_pid_map.get(src_port) or self._port_pid_map.get(dst_port)
+        if pid and pid in self._pid_name_map:
+            name = self._pid_name_map[pid]
+            self._cache[key] = name
+            self._pid_cache[key] = pid
+            return name, pid
+
+        # Fallback: full scan
         try:
             import psutil
-            kind = "inet"
-            for conn in psutil.net_connections(kind=kind):
-                if conn.status == "NONE":
+            for conn in psutil.net_connections(kind="inet"):
+                if conn.status == "NONE" or not conn.raddr:
                     continue
-                laddr = conn.laddr
-                raddr = conn.raddr
-                if not raddr:
-                    continue
-                if ((laddr.port == src_port and raddr.port == dst_port) or
-                    (laddr.port == dst_port and raddr.port == src_port)):
+                if ((conn.laddr.port == src_port and conn.raddr.port == dst_port) or
+                    (conn.laddr.port == dst_port and conn.raddr.port == src_port)):
                     try:
                         proc = psutil.Process(conn.pid)
                         name = proc.name()
                         self._cache[key] = name
                         self._pid_cache[key] = conn.pid
+                        self._pid_name_map[conn.pid] = name
                         return name, conn.pid
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
@@ -314,7 +367,6 @@ class ProcessResolver:
         """Get all current network connections with process info."""
         if not self._psutil_available:
             return {}
-
         import psutil
         result = {}
         try:
@@ -325,8 +377,7 @@ class ProcessResolver:
                     proc = psutil.Process(conn.pid) if conn.pid else None
                     name = proc.name() if proc else "System"
                     result[f"{conn.laddr.ip}:{conn.laddr.port}"] = {
-                        "pid": conn.pid,
-                        "name": name,
+                        "pid": conn.pid, "name": name,
                         "status": conn.status,
                         "remote": f"{conn.raddr.ip}:{conn.raddr.port}",
                     }
@@ -472,6 +523,14 @@ class SnifferEngine:
             "silent_connections": 0, "destinations": set(), "first_seen": 0.0,
             "last_seen": 0.0, "total_bytes": 0, "tracker_connections": 0
         })
+
+        # Alert intelligence state
+        self._seen_countries: Set[str] = set()
+        self._app_dest_baseline: Dict[str, Set[str]] = defaultdict(set)
+        self._last_bandwidth_avg = 0.0
+        self._bandwidth_samples: List[float] = []
+        self._suspicious_tlds = {'.tk', '.top', '.xyz', '.pw', '.cc', '.su', '.cn', '.ru',
+                                  '.bid', '.click', '.loan', '.racing', '.win', '.gq', '.cf', '.ga', '.ml'}
 
         # Bandwidth tracking
         self._bytes_window: List[tuple] = []
@@ -826,40 +885,99 @@ class SnifferEngine:
                 logger.debug(f"Callback error: {e}")
 
     def _update_privacy_score(self):
-        """Calculate privacy exposure score (0-100)."""
-        score = 0
-        score += min(30, len(self.stats.trackers_found) * 3)
-        score += min(20, len(self.stats.unique_destinations) * 0.3)
-        score += min(15, self.stats.tracker_bytes / (1024 * 1024) * 5)
-        score += min(15, len(self.stats.countries) * 2)
-        score += min(20, sum(1 for a in self.app_stats.values() if a.tracker_hits > 0) * 4)
-        self.stats.privacy_score = min(99, score)
+        """Calculate privacy exposure score (0-100) — weighted, severity-aware."""
+        score = 0.0
+        # Tracker severity weighting
+        tracker_score = 0
+        for conn in self.connections[-500:]:
+            if conn.is_tracker:
+                if conn.tracker_severity == "critical":
+                    tracker_score += 4
+                elif conn.tracker_severity == "high":
+                    tracker_score += 2.5
+                else:
+                    tracker_score += 1.5
+        score += min(30, tracker_score)
+        score += min(15, len(self.stats.unique_destinations) * 0.25)
+        score += min(15, (self.stats.tracker_bytes / (1024 * 1024)) * 8)
+        score += min(10, len(self.stats.countries) * 1.5)
+        score += min(15, sum(1 for a in self.app_stats.values() if a.tracker_hits > 0) * 4)
+        http_count = self.stats.protocols.get("HTTP", 0)
+        total_pkts = max(1, self.stats.total_packets)
+        score += min(10, (http_count / total_pkts) * 50)
+        elapsed = time.time() - self.stats.start_time
+        if elapsed > 300:
+            score *= min(1.0, 300 / elapsed + 0.5)
+        for app in self.app_stats.values():
+            if app.total_bytes_sent > app.total_bytes_recv * 3 and app.total_bytes_sent > 10240:
+                score += 2
+        self.stats.privacy_score = max(0, min(99, score))
 
     def _check_alerts(self, conn: ConnectionInfo):
-        """Generate alerts for suspicious activity."""
+        """Generate alerts — 10+ detection conditions."""
         alerts = []
-
+        # 1. Critical tracker
         if conn.is_tracker and conn.tracker_severity == "critical":
-            alerts.append({
-                "time": time.time(),
-                "level": "critical",
-                "message": f"Critical tracker active: {conn.tracker_name} ({conn.tracker_company})",
-                "app": conn.app_name,
-            })
-
-        if conn.dst_port not in (80, 443, 53, 8080, 8443) and conn.is_outbound:
-            if not self.geo_resolver.is_private(conn.dst_ip):
-                alerts.append({
-                    "time": time.time(),
-                    "level": "warning",
-                    "message": f"Unusual port {conn.dst_port} → {conn.dst_host or conn.dst_ip}",
-                    "app": conn.app_name,
-                })
+            alerts.append({"time": time.time(), "level": "critical",
+                "message": f"Critical tracker: {conn.tracker_name} ({conn.tracker_company})", "app": conn.app_name})
+        # 2. Unusual port
+        std_ports = {80, 443, 53, 8080, 8443, 993, 995, 587, 465, 143, 110, 22}
+        if conn.dst_port not in std_ports and conn.is_outbound and not self.geo_resolver.is_private(conn.dst_ip):
+            alerts.append({"time": time.time(), "level": "warning",
+                "message": f"Unusual port {conn.dst_port} > {conn.dst_host or conn.dst_ip}", "app": conn.app_name})
+        # 3. First connection to new country
+        if conn.geo and conn.geo.country_code not in ("??", "LO"):
+            if conn.geo.country not in self._seen_countries:
+                self._seen_countries.add(conn.geo.country)
+                if len(self._seen_countries) > 1:
+                    alerts.append({"time": time.time(), "level": "info",
+                        "message": f"New country: {conn.geo.country} ({conn.geo.country_code})", "app": conn.app_name})
+        # 4. App connecting to new destination after baseline
+        dest = conn.dst_host or conn.dst_ip
+        if conn.app_name != "Unknown" and conn.is_outbound:
+            known = self._app_dest_baseline.get(conn.app_name, set())
+            if len(known) > 5 and dest not in known:
+                alerts.append({"time": time.time(), "level": "info",
+                    "message": f"New dest for {conn.app_name}: {dest}", "app": conn.app_name})
+            self._app_dest_baseline[conn.app_name].add(dest)
+        # 5. Suspicious TLD
+        if conn.dst_host and "." in conn.dst_host:
+            tld = "." + conn.dst_host.rsplit(".", 1)[-1].lower()
+            if tld in self._suspicious_tlds:
+                alerts.append({"time": time.time(), "level": "warning",
+                    "message": f"Suspicious TLD ({tld}): {conn.dst_host}", "app": conn.app_name})
+        # 6. Unencrypted HTTP to external
+        if conn.proto_display == "HTTP" and conn.is_outbound and not self.geo_resolver.is_private(conn.dst_ip):
+            alerts.append({"time": time.time(), "level": "warning",
+                "message": f"Unencrypted HTTP > {conn.dst_host or conn.dst_ip}", "app": conn.app_name})
+        # 7. Large outbound transfer (>512KB)
+        if conn.length > 524288 and conn.is_outbound:
+            alerts.append({"time": time.time(), "level": "warning",
+                "message": f"Large outbound: {conn.length/1024:.0f}KB > {conn.dst_host or conn.dst_ip}", "app": conn.app_name})
+        # 8. Exfiltration pattern
+        if conn.app_name in self.app_stats:
+            app = self.app_stats[conn.app_name]
+            if (app.total_bytes_sent > app.total_bytes_recv * 5 and
+                app.total_bytes_sent > 102400 and app.packet_count > 20 and
+                not getattr(app, '_exfil_alerted', False)):
+                app._exfil_alerted = True
+                alerts.append({"time": time.time(), "level": "high",
+                    "message": f"Exfil pattern: {conn.app_name} sent {app.total_bytes_sent/1024:.0f}KB vs recv {app.total_bytes_recv/1024:.0f}KB", "app": conn.app_name})
+        # 9. DNS tunneling (very long subdomain)
+        if conn.dns_query and any(len(p) > 40 for p in conn.dns_query.split(".")):
+            alerts.append({"time": time.time(), "level": "high",
+                "message": f"Possible DNS tunneling: {conn.dns_query[:60]}...", "app": conn.app_name})
+        # 10. VPS/hosting on non-standard port (potential C2)
+        if conn.geo and conn.geo.org and conn.is_outbound and conn.dst_port not in (80, 443):
+            c2_kw = ["digitalocean", "linode", "vultr", "hetzner", "ovh", "contabo"]
+            if any(kw in conn.geo.org.lower() for kw in c2_kw):
+                alerts.append({"time": time.time(), "level": "warning",
+                    "message": f"VPS conn (port {conn.dst_port}): {conn.dst_host or conn.dst_ip} ({conn.geo.org})", "app": conn.app_name})
 
         for alert in alerts:
             self.stats.alerts.append(alert)
-            if len(self.stats.alerts) > 500:
-                self.stats.alerts = self.stats.alerts[-250:]
+            if len(self.stats.alerts) > 1000:
+                self.stats.alerts = self.stats.alerts[-500:]
             for cb in self._alert_callbacks:
                 try:
                     cb(alert)
