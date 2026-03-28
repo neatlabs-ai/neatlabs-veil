@@ -261,7 +261,7 @@ MIT License — see [LICENSE](LICENSE)
 
 ## Credits
 
-**VEIL** is a [NEATLABS™](https://github.com/neatlabs-ai) project — a Service-Disabled Veteran-Owned Small Business (SDVOSB) with 28+ years of federal cybersecurity experience.
+**VEIL** is a [NEATLABS™](https://github.com/neatlabs-ai/neatlabs-veil) project — a Service-Disabled Veteran-Owned Small Business (SDVOSB) with 28+ years of federal cybersecurity experience.
 
 Built with Python, PyQt6, Scapy, OpenAI, Anthropic, and HTML5 Canvas.
 
