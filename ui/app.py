@@ -1273,6 +1273,29 @@ class VeilMainWindow(QMainWindow):
             self.tray_icon = QSystemTrayIcon(self)
             self.tray_icon.setToolTip(f"VEIL {__version__} — Network Traffic Exposer")
 
+            # Generate tray icon programmatically (cyan diamond on dark bg)
+            from PyQt6.QtGui import QPixmap
+            pixmap = QPixmap(64, 64)
+            pixmap.fill(QColor(0, 0, 0, 0))
+            p = QPainter(pixmap)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(10, 10, 30)))
+            p.drawEllipse(2, 2, 60, 60)
+            p.setPen(QPen(QColor(0, 240, 255), 3))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(4, 4, 56, 56)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(0, 240, 255)))
+            from PyQt6.QtGui import QPolygon
+            from PyQt6.QtCore import QPoint
+            diamond = QPolygon([QPoint(32, 14), QPoint(46, 32), QPoint(32, 50), QPoint(18, 32)])
+            p.drawPolygon(diamond)
+            p.end()
+            icon = QIcon(pixmap)
+            self.tray_icon.setIcon(icon)
+            self.setWindowIcon(icon)
+
             tray_menu = QMenu()
             tray_menu.setStyleSheet("QMenu{background:#0a0a1a;color:#00f0ff;border:1px solid rgba(0,240,255,0.2);}"
                                    "QMenu::item{padding:6px 20px;}QMenu::item:selected{background:rgba(0,240,255,0.1);}")
