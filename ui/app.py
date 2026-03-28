@@ -14,6 +14,7 @@ import json
 import logging
 from datetime import datetime
 from collections import defaultdict
+from typing import List
 from functools import partial
 
 from PyQt6.QtWidgets import (
@@ -23,7 +24,7 @@ from PyQt6.QtWidgets import (
     QStatusBar, QMenuBar, QMenu, QFileDialog, QMessageBox, QTextEdit,
     QProgressBar, QDockWidget, QGroupBox, QCheckBox,
     QListWidget, QListWidgetItem, QAbstractItemView, QToolBar, QSizePolicy,
-    QSpacerItem, QPlainTextEdit, QInputDialog,
+    QSpacerItem, QPlainTextEdit, QInputDialog, QSystemTrayIcon,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, pyqtSignal, QSize, QUrl, QDateTime,
@@ -55,7 +56,7 @@ from ui.widgets import (
 
 logger = logging.getLogger("veil.app")
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 # ---------------------------------------------------------------------------
 # Helper Widgets
@@ -175,36 +176,52 @@ class AlertsWidget(QFrame):
 # Connection Table
 # ---------------------------------------------------------------------------
 
-class ConnectionTable(QTableWidget):
-    """Full connection details table."""
+# ---------------------------------------------------------------------------
+# Connection Table — High-performance model/view (#4)
+# ---------------------------------------------------------------------------
+
+class ConnectionTableModel(Qt.QAbstractTableModel if hasattr(Qt, 'QAbstractTableModel') else object):
+    """Dummy fallback — actual model defined below."""
+    pass
+
+# Use QAbstractTableModel for proper model/view performance
+from PyQt6.QtCore import QAbstractTableModel, QModelIndex
+
+class ConnModel(QAbstractTableModel):
+    """High-performance table model for connection data."""
     COLUMNS = ["Time", "App", "Protocol", "Destination", "Host",
                "Port", "Bytes", "Dir", "Tracker", "Country", "Org"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setColumnCount(len(self.COLUMNS))
-        self.setHorizontalHeaderLabels(self.COLUMNS)
-        self.setAlternatingRowColors(True)
-        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.setSortingEnabled(True)
-        self.verticalHeader().setVisible(False)
-        self.setShowGrid(False)
-        header = self.horizontalHeader()
-        header.setStretchLastSection(True)
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        for i, w in enumerate([80, 110, 65, 140, 200, 55, 70, 45, 140, 80, 100]):
-            self.setColumnWidth(i, w)
-        self.verticalHeader().setDefaultSectionSize(26)
-        self._max_rows = 2000
+        self._data: List[list] = []
+        self._colors: List[list] = []
+        self._max_rows = 5000
 
-    def add_connection(self, conn: ConnectionInfo):
-        if self.rowCount() >= self._max_rows:
-            self.removeRow(0)
-        row = self.rowCount()
-        self.insertRow(row)
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._data)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self.COLUMNS)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        if role == Qt.ItemDataRole.DisplayRole:
+            return self._data[index.row()][index.column()]
+        if role == Qt.ItemDataRole.ForegroundRole:
+            c = self._colors[index.row()][index.column()]
+            return QColor(c) if c else None
+        return None
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+            return self.COLUMNS[section]
+        return None
+
+    def add_connection(self, conn):
         ts = datetime.fromtimestamp(conn.timestamp).strftime("%H:%M:%S")
-        items_data = [
+        row_data = [
             ts, conn.app_name, conn.proto_display, conn.dst_ip,
             conn.dst_host or conn.dst_ip, str(conn.dst_port),
             self._fmt(conn.length), conn.direction,
@@ -212,23 +229,67 @@ class ConnectionTable(QTableWidget):
             conn.geo.country_code if conn.geo else "",
             conn.geo.org if conn.geo else "",
         ]
-        for col, text in enumerate(items_data):
-            item = QTableWidgetItem(text)
-            if conn.is_tracker:
-                item.setForeground(QColor(Colors.RED))
-            elif col == 2:
-                color = Colors.PROTOCOL_COLORS.get(conn.proto_display, Colors.CYAN)
-                item.setForeground(QColor(color))
-            elif col == 7:
-                item.setForeground(QColor(Colors.ORANGE if text == "OUT" else Colors.GREEN))
-            self.setItem(row, col, item)
-        self.scrollToBottom()
+        row_colors = [None] * len(self.COLUMNS)
+        if conn.is_tracker:
+            row_colors = [Colors.RED] * len(self.COLUMNS)
+        else:
+            row_colors[2] = Colors.PROTOCOL_COLORS.get(conn.proto_display, None)
+            row_colors[7] = Colors.ORANGE if conn.direction == "OUT" else Colors.GREEN
+
+        if len(self._data) >= self._max_rows:
+            self.beginRemoveRows(QModelIndex(), 0, 0)
+            self._data.pop(0)
+            self._colors.pop(0)
+            self.endRemoveRows()
+
+        pos = len(self._data)
+        self.beginInsertRows(QModelIndex(), pos, pos)
+        self._data.append(row_data)
+        self._colors.append(row_colors)
+        self.endInsertRows()
 
     @staticmethod
     def _fmt(b):
         if b < 1024: return f"{b} B"
         elif b < 1048576: return f"{b/1024:.1f} K"
         return f"{b/1048576:.1f} M"
+
+
+class ConnectionTable(QFrame):
+    """Connection table using model/view for performance."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        from PyQt6.QtWidgets import QTableView
+        self.model = ConnModel()
+        self.view = QTableView()
+        self.view.setModel(self.model)
+        self.view.setAlternatingRowColors(True)
+        self.view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.view.setSortingEnabled(True)
+        self.view.verticalHeader().setVisible(False)
+        self.view.setShowGrid(False)
+        self.view.horizontalHeader().setStretchLastSection(True)
+        self.view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        for i, w in enumerate([80, 110, 65, 140, 200, 55, 70, 45, 140, 80, 100]):
+            self.view.setColumnWidth(i, w)
+        self.view.verticalHeader().setDefaultSectionSize(26)
+        layout.addWidget(self.view)
+
+    def add_connection(self, conn):
+        self.model.add_connection(conn)
+        self.view.scrollToBottom()
+
+    def setRowCount(self, n):
+        """Compatibility — clear all data."""
+        if n == 0:
+            self.model.beginResetModel()
+            self.model._data.clear()
+            self.model._colors.clear()
+            self.model.endResetModel()
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +707,10 @@ class VeilMainWindow(QMainWindow):
 
         self._last_pkt_count = 0
         self._last_tracker_count = 0
+        self._current_font_size = 12
+
+        # System tray icon (#5)
+        self._setup_tray()
 
         logger.info(f"VEIL {__version__} UI initialized")
 
@@ -666,6 +731,7 @@ class VeilMainWindow(QMainWindow):
         for text, shortcut, slot in [
             ("Export &JSON...", "Ctrl+J", self.export_json),
             ("Export &CSV...", "Ctrl+E", self.export_csv),
+            ("Export &HTML Report...", "Ctrl+H", self.export_html_report),
         ]:
             action = QAction(text, self)
             action.setShortcut(shortcut)
@@ -682,6 +748,14 @@ class VeilMainWindow(QMainWindow):
         self.toggle_globe_action = QAction("Show &Globe", self, checkable=True, checked=True)
         self.toggle_globe_action.triggered.connect(lambda c: self.globe.setVisible(c))
         view_menu.addAction(self.toggle_globe_action)
+        view_menu.addSeparator()
+        font_menu = view_menu.addMenu("&Font Size")
+        for label, size in [("Small (10px)", 10), ("Medium (12px)", 12),
+                            ("Large (14px)", 14), ("Extra Large (16px)", 16)]:
+            fa = QAction(label, self, checkable=True, checked=(size == 12))
+            fa.triggered.connect(lambda checked, s=size: self._set_font_size(s))
+            font_menu.addAction(fa)
+        self._font_actions = font_menu.actions()
 
         # Capture menu
         capture_menu = menubar.addMenu("&Capture")
@@ -697,6 +771,12 @@ class VeilMainWindow(QMainWindow):
         set_key = QAction("Set &API Key...", self)
         set_key.triggered.connect(self._set_api_key)
         ai_menu.addAction(set_key)
+
+        self.privacy_toggle = QAction("&Privacy Mode (Anonymize Data)", self, checkable=True)
+        self.privacy_toggle.setToolTip("Anonymize IPs and hostnames before sending to AI")
+        self.privacy_toggle.triggered.connect(self._toggle_privacy_mode)
+        ai_menu.addAction(self.privacy_toggle)
+
         ai_menu.addSeparator()
         for text, slot_name in [
             ("Full Traffic &Analysis", "_run_summary"),
@@ -999,6 +1079,12 @@ class VeilMainWindow(QMainWindow):
 
     def _handle_alert(self, alert):
         self.alerts_panel.add_alert(alert)
+        # Tray notification for critical/high alerts when minimized
+        if alert.get("level") in ("critical", "high") and not self.isVisible():
+            self._tray_notify(
+                f"VEIL Alert [{alert['level'].upper()}]",
+                alert.get("message", "Security alert detected")
+            )
 
     # ---- Periodic Updates ----
     def _update_stats(self):
@@ -1129,7 +1215,7 @@ class VeilMainWindow(QMainWindow):
             "what data is flowing, which apps are phoning home, "
             "and which trackers are active.</p>"
             "<br>"
-            "<p><b>AI Engine:</b> OpenAI GPT-4.1-nano</p>"
+            "<p><b>AI Engine:</b> OpenAI GPT-4.1-nano / Anthropic Claude (user's choice)</p>"
             "<p><b>Capture:</b> Scapy / Raw Socket / psutil (3-tier fallback)</p>"
             "<p><b>Tracker DB:</b> 67+ signatures</p>"
             "<br>"
@@ -1154,20 +1240,166 @@ class VeilMainWindow(QMainWindow):
         )
 
     def _set_api_key(self):
-        key, ok = QInputDialog.getText(self, "Set OpenAI API Key",
-            "Enter your OpenAI API key for AI analysis:\n(Uses GPT-4.1-nano for traffic intelligence)")
+        key, ok = QInputDialog.getText(self, "Set AI API Key",
+            "Enter your API key:\n\n"
+            "  OpenAI:     sk-...          (GPT-4.1-nano)\n"
+            "  Anthropic:  sk-ant-...      (Claude Sonnet 4)\n\n"
+            "VEIL auto-detects the provider from your key format.")
         if ok and key.strip():
-            self.ai_analyzer.set_api_key(key.strip())
+            key = key.strip()
+            self.ai_analyzer.set_api_key(key)
             self.ai_chat.set_analyzer(self.ai_analyzer, self.engine)
-            self.statusBar().showMessage("AI API key configured successfully")
+
+            provider = self.ai_analyzer.provider_display
+            self.statusBar().showMessage(f"AI configured: {provider}")
+
+            # Update model label in chat panel
+            self.ai_chat.model_label.setText(self.ai_analyzer.model.upper())
+
             QMessageBox.information(self, "AI Ready",
-                "OpenAI API key set successfully.\nGPT-4.1-nano is now available for traffic analysis.")
+                f"AI engine configured successfully.\n\n"
+                f"Provider: {self.ai_analyzer.provider.upper()}\n"
+                f"Model: {self.ai_analyzer.model}\n\n"
+                f"All analysis features are now available.")
 
     def _take_snapshot(self):
         if self.engine.running and self.engine.stats.total_packets > 0:
             self.snapshot_panel.take_snapshot(self.engine)
 
+    # ---- System Tray (#5) ----
+    def _setup_tray(self):
+        """Create system tray icon with context menu."""
+        try:
+            self.tray_icon = QSystemTrayIcon(self)
+            self.tray_icon.setToolTip(f"VEIL {__version__} — Network Traffic Exposer")
+
+            tray_menu = QMenu()
+            tray_menu.setStyleSheet("QMenu{background:#0a0a1a;color:#00f0ff;border:1px solid rgba(0,240,255,0.2);}"
+                                   "QMenu::item{padding:6px 20px;}QMenu::item:selected{background:rgba(0,240,255,0.1);}")
+            show_action = QAction("Show VEIL", self)
+            show_action.triggered.connect(self._tray_show)
+            tray_menu.addAction(show_action)
+            tray_menu.addSeparator()
+            start_action = QAction("Start Capture", self)
+            start_action.triggered.connect(self.start_capture)
+            tray_menu.addAction(start_action)
+            stop_action = QAction("Stop Capture", self)
+            stop_action.triggered.connect(self.stop_capture)
+            tray_menu.addAction(stop_action)
+            tray_menu.addSeparator()
+            quit_action = QAction("Quit", self)
+            quit_action.triggered.connect(self._tray_quit)
+            tray_menu.addAction(quit_action)
+
+            self.tray_icon.setContextMenu(tray_menu)
+            self.tray_icon.activated.connect(self._tray_activated)
+            self.tray_icon.show()
+            logger.info("System tray icon created")
+        except Exception as e:
+            logger.debug(f"System tray not available: {e}")
+            self.tray_icon = None
+
+    def _tray_show(self):
+        self.showNormal()
+        self.activateWindow()
+
+    def _tray_quit(self):
+        if self.engine.running:
+            self.engine.stop()
+        if self.tray_icon:
+            self.tray_icon.hide()
+        QApplication.quit()
+
+    def _tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._tray_show()
+
+    def _tray_notify(self, title: str, message: str):
+        """Show tray notification for critical alerts."""
+        if self.tray_icon and self.tray_icon.isVisible():
+            try:
+                self.tray_icon.showMessage(title, message,
+                    QSystemTrayIcon.MessageIcon.Warning, 5000)
+            except Exception:
+                pass
+
+    def changeEvent(self, event):
+        """Minimize to tray instead of taskbar."""
+        from PyQt6.QtCore import QEvent
+        if event.type() == QEvent.Type.WindowStateChange:
+            if self.windowState() & Qt.WindowState.WindowMinimized:
+                if self.tray_icon and self.tray_icon.isVisible():
+                    event.ignore()
+                    self.hide()
+                    score = int(self.engine.stats.privacy_score)
+                    self.tray_icon.setToolTip(
+                        f"VEIL — Privacy Score: {score}/100 | "
+                        f"{self.engine.stats.total_packets:,} packets")
+                    return
+        super().changeEvent(event)
+
+    # ---- HTML Report Export (#7) ----
+    def export_html_report(self):
+        """Export styled HTML privacy report."""
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Export HTML Report",
+            f"veil_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
+            "HTML Files (*.html)")
+        if filepath:
+            try:
+                html = self.ai_analyzer.generate_html_report(self.engine)
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(html)
+                self.statusBar().showMessage(f"HTML report exported to {filepath}")
+                # Offer to open it
+                reply = QMessageBox.question(self, "Report Exported",
+                    f"Report saved to:\n{filepath}\n\nOpen in browser?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                if reply == QMessageBox.StandardButton.Yes:
+                    import webbrowser
+                    webbrowser.open(f"file:///{filepath}")
+            except Exception as e:
+                QMessageBox.warning(self, "Export Failed", f"Error: {e}")
+
+    # ---- Font Size (#9) ----
+    def _set_font_size(self, size: int):
+        """Change application font size."""
+        self._current_font_size = size
+        app = QApplication.instance()
+        if app:
+            # Update base stylesheet with new size
+            from ui.styles import CYBERPUNK_STYLESHEET
+            adjusted = CYBERPUNK_STYLESHEET.replace("font-size: 12px", f"font-size: {size}px")
+            adjusted = adjusted.replace("font-size: 11px", f"font-size: {max(9, size - 1)}px")
+            adjusted = adjusted.replace("font-size: 10px", f"font-size: {max(8, size - 2)}px")
+            app.setStyleSheet(adjusted)
+        # Update font action checkmarks
+        sizes = [10, 12, 14, 16]
+        if hasattr(self, '_font_actions'):
+            for i, action in enumerate(self._font_actions):
+                action.setChecked(sizes[i] == size)
+        self.statusBar().showMessage(f"Font size set to {size}px")
+
+    # ---- Privacy Mode Toggle ----
+    def _toggle_privacy_mode(self, enabled):
+        """Toggle AI privacy translation layer."""
+        self.ai_analyzer.set_privacy_mode(enabled)
+        status = "ON — IPs and hostnames will be anonymized before AI analysis" if enabled else "OFF — Full data sent to AI"
+        self.statusBar().showMessage(f"Privacy Mode: {status}")
+        if enabled:
+            QMessageBox.information(self, "Privacy Mode Enabled",
+                "Privacy Translation Layer is now ACTIVE.\n\n"
+                "When AI analysis runs, your personal data will be anonymized:\n"
+                "  - IP addresses replaced with [ENDPOINT_1], [ENDPOINT_2], etc.\n"
+                "  - Personal hostnames replaced with [HOST_1], [HOST_2], etc.\n"
+                "  - Local network IPs shown as [LOCAL_NET]\n\n"
+                "Tracker names, companies, protocols, and traffic patterns\n"
+                "are preserved for accurate analysis.\n\n"
+                "No personally identifiable information is sent to OpenAI.")
+
     def closeEvent(self, event):
         if self.engine.running:
             self.engine.stop()
+        if hasattr(self, 'tray_icon') and self.tray_icon:
+            self.tray_icon.hide()
         event.accept()
