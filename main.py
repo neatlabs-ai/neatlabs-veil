@@ -133,7 +133,11 @@ For full packet capture, run as Administrator (Windows) or sudo (Linux/macOS).
     except ImportError:
         logger.warning("psutil not found")
     try:
-        import openai; deps.append("openai (AI analysis)")
+        import openai; deps.append("openai (GPT analysis)")
+    except ImportError:
+        pass
+    try:
+        import anthropic; deps.append("anthropic (Claude analysis)")
     except ImportError:
         pass
     try:

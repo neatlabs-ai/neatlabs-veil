@@ -8,6 +8,7 @@ PyQt6>=6.5.0
 PyQt6-WebEngine>=6.5.0    # 3D globe visualization
 psutil>=5.9.0             # Process mapping + fallback capture
 
-# Optional
+# Optional — AI analysis (choose one or both)
 scapy>=2.5.0              # Full packet capture (needs admin/root)
-openai==0.28              # AI-powered traffic analysis (GPT-4.1-nano)
+openai==0.28              # OpenAI GPT-4.1-nano analysis
+anthropic>=0.30.0         # Anthropic Claude analysis
